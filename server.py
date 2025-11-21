@@ -88,9 +88,9 @@ import asyncio
 # Global: Request Queuing Semaphore
 # --------------------------------------------------------------------------------------
 # Limit to 1 concurrent TTS synthesis to prevent GPU OOM
-tts_semaphore = asyncio.Semaphore(1)
+# Note: Initialized in lifespan to avoid "no running event loop" error
+tts_semaphore: Optional[asyncio.Semaphore] = None
 logger_init = logging.getLogger("tts_server_init")
-logger_init.info("TTS request semaphore initialized (max concurrent: 1)")
 
 
 class OpenAISpeechRequest(BaseModel):
@@ -164,7 +164,12 @@ def _delayed_browser_open(host: str, port: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global tts_semaphore
     logger.info("TTS Server: Initializing...")
+    
+    # Initialize request semaphore (needs running event loop)
+    tts_semaphore = asyncio.Semaphore(1)
+    logger.info("TTS request semaphore initialized (max concurrent: 1)")
 
     output_path = get_output_path(ensure_absolute=True)
     reference_audio_path = get_reference_audio_path(ensure_absolute=True)
@@ -183,14 +188,23 @@ async def lifespan(app: FastAPI):
     model_cache_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Model cache directory: {model_cache_path}")
 
+    repo_id = get_model_repo_id()
+    cache_dir = get_model_cache_path(ensure_absolute=True)
+    device = get_device_setting()
+
+    logger.info(f"Model repository: {repo_id}")
+    logger.info(f"Model cache directory: {cache_dir}")
+    logger.info(f"Device for TTS: {device}")
+
+    logger.info("Loading TTS model...")
     try:
-        if not engine.load_model():
-            logger.critical("Failed to load TTS model during startup.")
-        else:
-            logger.info("TTS Model loaded successfully via engine.")
-            model_loaded_event.set()
+        engine.load_model(repo_id, str(cache_dir), device)
+        logger.info("TTS model loaded successfully.")
+        model_loaded_event.set()
     except Exception as e:
         logger.exception(f"Exception during model loading: {e}")
+        # Optionally, re-raise or exit if model loading is critical
+        sys.exit(1) # Exit if model loading fails
 
     try:
         server_host = get_host()
@@ -210,13 +224,11 @@ async def lifespan(app: FastAPI):
     
     # Cleanup old files on startup
     try:
-        output_path = get_output_path()
-        import shutil
-        from datetime import datetime, timedelta
-        
+        output_path = get_output_path(ensure_absolute=True)
+        cutoff = datetime.now() - timedelta(days=7)
         count = 0
-        cutoff = datetime.now() - timedelta(days=1)
-        for file in output_path.glob("*"):
+        
+        for file in output_path.iterdir():
             if file.is_file() and datetime.fromtimestamp(file.stat().st_mtime) < cutoff:
                 try:
                     file.unlink()
