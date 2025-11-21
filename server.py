@@ -738,42 +738,91 @@ async def process_tts_job_background(job_id: str, request: CustomTTSRequest):
 # Routes: Async Job Queue (for long-running TTS beyond 10-minute timeout)
 # --------------------------------------------------------------------------------------
 
-@app.post("/jobs/submit", response_model=JobSubmissionResponse)
-async def submit_tts_job(request: CustomTTSRequest, background_tasks: BackgroundTasks):
-    """
-    Submit a TTS job for async processing.
-    Returns immediately with a job ID.
-    Use /jobs/{job_id}/status to check progress.
-    """
-    # Quick validation
+# Debug logging setup
+DEBUG_LOG_PATH = Path("/data/debug.log")
+
+def log_debug(msg: str):
+    """Write debug message to persistent log file"""
     try:
-        validated_text = validation.validate_text_input(request.text)
+        # Ensure directory exists (local testing support)
+        if not DEBUG_LOG_PATH.parent.exists():
+            DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            
+        with open(DEBUG_LOG_PATH, "a") as f:
+            f.write(f"{datetime.now().isoformat()} - {msg}\n")
+    except Exception as e:
+        print(f"Failed to write debug log: {e}")
+
+@app.get("/debug")
+async def get_debug_logs():
+    """Retrieve last 100 lines of debug log"""
+    if DEBUG_LOG_PATH.exists():
+        try:
+            content = DEBUG_LOG_PATH.read_text()
+            return {"logs": content.splitlines()[-100:]}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"logs": ["Log file not found"]}
+
+@app.post("/jobs/submit", response_model=JobSubmissionResponse)
+async def submit_tts_job(request: Request, tts_request: CustomTTSRequest):
+    """
+    Submit a TTS job for asynchronous processing.
+    Returns a Job ID immediately.
+    """
+    request_id = str(uuid.uuid4())
+    log_debug(f"[{request_id}] Received submission request")
+    
+    try:
+        # 1. Validate Input
+        log_debug(f"[{request_id}] Validating input text length: {len(tts_request.text)}")
+        validation.validate_text_input(tts_request.text)
+        
+        log_debug(f"[{request_id}] Validating configuration")
+        # Validate configuration
+        tts_request.cfg_weight = validation.validate_cfg_weight(tts_request.cfg_weight)
+        
+        # 2. Create Job
+        log_debug(f"[{request_id}] Getting job manager")
+        job_manager = jobs.get_job_manager()
+        
+        log_debug(f"[{request_id}] Adding job to queue")
+        job_id = await job_manager.add_job(
+            text=tts_request.text,
+            voice_mode=tts_request.voice_mode,
+            predefined_voice_id=tts_request.predefined_voice_id,
+            reference_audio_path=tts_request.reference_audio_path,
+            chunk_size=tts_request.chunk_size,
+            split_text=tts_request.split_text,
+            config={
+                "temperature": tts_request.temperature,
+                "cfg_weight": tts_request.cfg_weight,
+                "speed_factor": tts_request.speed_factor,
+                "seed": tts_request.seed
+            }
+        )
+        log_debug(f"[{request_id}] Job created with ID: {job_id}")
+
+        # 3. Start Background Task
+        log_debug(f"[{request_id}] Starting background task")
+        asyncio.create_task(process_tts_job_background(job_id, tts_request))
+        log_debug(f"[{request_id}] Background task started")
+
+        return JobSubmissionResponse(
+            job_id=job_id,
+            status=JobStatus.QUEUED,
+            message="Job submitted successfully. Use job_id to track progress.",
+            estimated_chunks=1 # Initial estimate, will be updated
+        )
+
     except validation.ValidationError as e:
-        raise e
-    
-    # Create job
-    job_manager = jobs.get_job_manager()
-    job_id = job_manager.create_job(text_length=len(validated_text))
-    
-    # Estimate chunks
-    chunk_size = validation.validate_chunk_size(request.chunk_size)
-    estimated_chunks = (len(validated_text) // chunk_size) + 1
-    
-    # Start background processing
-    background_tasks.add_task(
-        process_tts_job_background,
-        job_id=job_id,
-        request=request
-    )
-    
-    logger.info(f"Job {job_id} submitted for async processing ({estimated_chunks} chunks estimated)")
-    
-    return JobSubmissionResponse(
-        job_id=job_id,
-        status="queued",
-        message=f"Job submitted successfully. Use /jobs/{job_id}/status to track progress.",
-        estimated_chunks=estimated_chunks
-    )
+        log_debug(f"[{request_id}] Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_debug(f"[{request_id}] Unexpected error: {e}")
+        logger.error(f"Job submission failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
 
 
 @app.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
