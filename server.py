@@ -787,21 +787,8 @@ async def submit_tts_job(request: Request, tts_request: CustomTTSRequest):
         log_debug(f"[{request_id}] Getting job manager")
         job_manager = jobs.get_job_manager()
         
-        log_debug(f"[{request_id}] Adding job to queue")
-        job_id = await job_manager.add_job(
-            text=tts_request.text,
-            voice_mode=tts_request.voice_mode,
-            predefined_voice_id=tts_request.predefined_voice_id,
-            reference_audio_path=tts_request.reference_audio_path,
-            chunk_size=tts_request.chunk_size,
-            split_text=tts_request.split_text,
-            config={
-                "temperature": tts_request.temperature,
-                "cfg_weight": tts_request.cfg_weight,
-                "speed_factor": tts_request.speed_factor,
-                "seed": tts_request.seed
-            }
-        )
+        log_debug(f"[{request_id}] Creating job")
+        job_id = job_manager.create_job(text_length=len(tts_request.text))
         log_debug(f"[{request_id}] Job created with ID: {job_id}")
 
         # 3. Start Background Task
